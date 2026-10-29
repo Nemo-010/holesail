@@ -33,7 +33,7 @@ jobs:
 
   release:
     if: >-
-      ${{ !cancelled() && github.ref_name == 'appimage'
+      ${{ !cancelled() && github.ref_name == 'main'
       && needs.build.result == 'success' }}
     needs: [build]
     permissions: write-all
