@@ -15,7 +15,7 @@ get-debloated-pkgs --add-common --prefer-nano
 
 case "$ARCH" in
 	x86_64) BARE_ARCH=x64 ;;
-	aarch64) BARE_ARrm64 ;;
+	aarch64) BARE_ARCH=arm64 ;;
 	*) BARE_ARCH=$ARCH ;;
 esac
 
