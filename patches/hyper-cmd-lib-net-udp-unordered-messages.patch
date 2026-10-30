@@ -1,0 +1,136 @@
+--- a/index.js
++++ b/index.js
+@@ -2,6 +2,12 @@
+ const net = require('net')
+ const EventEmitter = require('events')
+ 
++// A udx message is spliced across a couple of MTU sized packets and reassembled
++// on the far side, but it is silently dropped somewhere past two MTUs. Measured
++// on udx-native 1.22.0 with its default 1200 byte MTU: 2000 bytes arrive, 2050
++// disappear. Game packets cap out around 1400 bytes, so this is headroom.
++const MAX_DATAGRAM = 2000
++
+ function connPiper(connection, _dst, opts = {}, stats = {}) {
+   const logger = opts.logger || { log: () => {} }
+   logger.log({ type: 1, msg: 'Starting TCP connection piper' })
+@@ -268,6 +274,7 @@
+ function createUdpFramedProxy(listenOpts, connectRemote, logger, onBind) {
+   const proxySocket = dgram.createSocket('udp4')
+   const clients = new Map()
++  let dropped = 0
+ 
+   proxySocket.on('error', (err) => {
+     logger.log({ type: 3, msg: `Proxy socket error: ${err.stack}` })
+@@ -277,23 +284,27 @@
+   proxySocket.on('message', (msg, rinfo) => {
+     const clientId = `${rinfo.address}:${rinfo.port}`
+     logger.log({ type: 0, msg: `UDP message from ${clientId}: ${msg.length} bytes` })
++
++    if (msg.length > MAX_DATAGRAM) {
++      if (dropped++ === 0) {
++        logger.log({
++          type: 2,
++          msg: `Dropping ${msg.length} byte datagram from ${clientId}, over the ${MAX_DATAGRAM} byte message limit`
++        })
++      }
++      return
++    }
++
+     let client = clients.get(clientId)
+     if (!client) {
+       const remoteStream = connectRemote()
+-      client = { remoteStream, rinfo, buffer: Buffer.alloc(0) }
++      client = { remoteStream, rinfo }
+       clients.set(clientId, client)
+-      remoteStream.on('data', (chunk) => {
+-        client.buffer = Buffer.concat([client.buffer, chunk])
+-        while (client.buffer.length >= 4) {
+-          const len = client.buffer.readUInt32BE(0)
+-          if (client.buffer.length < 4 + len) break
+-          const response = client.buffer.slice(4, 4 + len)
+-          logger.log({ type: 0, msg: `UDP response for ${clientId}: ${response.length} bytes` })
+-          proxySocket.send(response, 0, response.length, rinfo.port, rinfo.address, (err) => {
+-            if (err) logger.log({ type: 3, msg: `Send error to ${clientId}: ${err.stack}` })
+-          })
+-          client.buffer = client.buffer.slice(4 + len)
+-        }
++      remoteStream.on('message', (response) => {
++        logger.log({ type: 0, msg: `UDP response for ${clientId}: ${response.length} bytes` })
++        proxySocket.send(response, 0, response.length, rinfo.port, rinfo.address, (err) => {
++          if (err) logger.log({ type: 3, msg: `Send error to ${clientId}: ${err.stack}` })
++        })
+       })
+       remoteStream.on('error', (err) => {
+         logger.log({ type: 3, msg: `Remote error for ${clientId}: ${err.stack}` })
+@@ -305,9 +316,8 @@
+         clients.delete(clientId)
+       })
+     }
+-    const lenBuf = Buffer.alloc(4)
+-    lenBuf.writeUInt32BE(msg.length, 0)
+-    client.remoteStream.write(Buffer.concat([lenBuf, msg]))
++
++    client.remoteStream.trySend(msg)
+   })
+ 
+   proxySocket.bind(listenOpts.port, listenOpts.host, onBind)
+@@ -317,34 +327,37 @@
+ 
+ function pipeUdpFramedServer(remoteStream, localOpts, logger, stats) {
+   const localSocket = dgram.createSocket('udp4')
+-  let buffer = Buffer.alloc(0)
++  let dropped = 0
++
++  function drop(msg) {
++    if (dropped++ === 0) {
++      logger.log({
++        type: 2,
++        msg: `Dropping ${msg.length} byte datagram, over the ${MAX_DATAGRAM} byte message limit`
++      })
++    }
++  }
++
++  localSocket.on('message', (msg) => {
++    logger.log({ type: 0, msg: `Data from local to remote: ${msg.length} bytes` })
++    if (msg.length > MAX_DATAGRAM) return drop(msg)
++    remoteStream.trySend(msg)
++  })
++
++  remoteStream.on('message', (msg) => {
++    logger.log({ type: 0, msg: `Data from remote to local: ${msg.length} bytes` })
++    localSocket.send(msg, 0, msg.length, +localOpts.port, localOpts.host, (err) => {
++      if (err) logger.log({ type: 3, msg: `Send error to local: ${err.stack}` })
++    })
++  })
++
+   localSocket.on('error', (err) => {
+     logger.log({ type: 3, msg: `Local UDP socket error: ${err.stack}` })
+     remoteStream.destroy(err)
+   })
+-  localSocket.on('message', (msg) => {
+-    logger.log({ type: 0, msg: `Data from local to remote: ${msg.length} bytes` })
+-    const lenBuf = Buffer.alloc(4)
+-    lenBuf.writeUInt32BE(msg.length, 0)
+-    remoteStream.write(Buffer.concat([lenBuf, msg]))
+-  })
+-  remoteStream.on('data', (chunk) => {
+-    logger.log({ type: 0, msg: `Data from remote to local: ${chunk.length} bytes` })
+-    buffer = Buffer.concat([buffer, chunk])
+-    while (buffer.length >= 4) {
+-      const len = buffer.readUInt32BE(0)
+-      if (buffer.length < 4 + len) break
+-      const msg = buffer.slice(4, 4 + len)
+-      localSocket.send(msg, 0, msg.length, +localOpts.port, localOpts.host, (err) => {
+-        if (err) logger.log({ type: 3, msg: `Send error to local: ${err.stack}` })
+-      })
+-      buffer = buffer.slice(4 + len)
+-    }
+-  })
+   remoteStream.on('end', () => localSocket.close())
+   localSocket.on('close', () => remoteStream.end())
+-  remoteStream.on('error', (err) => localSocket.close())
+-  localSocket.on('error', (err) => remoteStream.destroy(err))
++  remoteStream.on('error', () => localSocket.close())
+ }
+ 
+ module.exports = {

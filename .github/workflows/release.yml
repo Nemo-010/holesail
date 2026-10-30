@@ -58,6 +58,19 @@ jobs:
         if: ${{ matrix.platform == 'win32' }}
       - run: npm install -g bare-make
       - run: npm install
+      - name: Send UDP as unordered messages
+        shell: bash
+        run: |
+          set -eu
+          lib=node_modules/@holesail/hyper-cmd-lib-net
+          version=$(node -p "require('./$lib/package.json').version")
+          if [ "$version" != "1.1.2" ]; then
+            echo "@holesail/hyper-cmd-lib-net resolved to $version, the patch targets 1.1.2" >&2
+            exit 1
+          fi
+          git apply -p1 --directory="$lib" --whitespace=nowarn \
+            patches/hyper-cmd-lib-net-udp-unordered-messages.patch
+          grep -q MAX_DATAGRAM "$lib/index.js"
       - run: bare-make generate --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} ${{ matrix.flags }}
       - name: Patch the missing cast in libjstl
         shell: bash
@@ -116,7 +129,12 @@ jobs:
           retention-days: 5
 
   release:
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.appimage.result == 'success' }}
+    # Only main and version tags publish. A workflow run from any other branch
+    # builds and uploads artifacts, and stops there.
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success'
+      && needs.appimage.result == 'success'
+      && (github.ref_name == 'main' || startsWith(github.ref, 'refs/tags/')) }}
     needs: [build, appimage]
     permissions:
       contents: write
